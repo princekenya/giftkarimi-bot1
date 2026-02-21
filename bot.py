@@ -13,6 +13,7 @@ import schedule
 import time
 import threading
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request, render_template_string
 from dotenv import load_dotenv
 
@@ -806,11 +807,35 @@ def health():
 # ─── Scheduler & Main ────────────────────────────────────────────────────────
 
 def run_scheduler():
-    schedule.every().day.at(SEND_TIME).do(broadcast_events)
-    log.info(f"Scheduler: daily at {SEND_TIME}")
+    """Checks time every 30 seconds and broadcasts at exact send time."""
+    log.info(f"Scheduler started — daily broadcast at {SEND_TIME} EAT")
+    last_broadcast_date = None
+    EAT = ZoneInfo("Africa/Nairobi")
     while True:
-        schedule.run_pending()
+        now       = datetime.now(EAT)
+        today_str = now.strftime("%Y-%m-%d")
+        now_time  = now.strftime("%H:%M")
+        if now_time == SEND_TIME and last_broadcast_date != today_str:
+            log.info(f"It is {SEND_TIME} EAT — broadcasting now!")
+            broadcast_events()
+            last_broadcast_date = today_str
         time.sleep(30)
+
+def self_ping():
+    """Pings /health every 5 minutes to prevent Railway free tier from sleeping."""
+    app_url = os.getenv("RAILWAY_STATIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
+    if not app_url:
+        log.warning("No app URL for self-ping — bot may sleep and miss send time.")
+        return
+    ping_url = f"https://{app_url}/health"
+    log.info(f"Self-ping active → {ping_url} every 5 min")
+    while True:
+        try:
+            resp = requests.get(ping_url, timeout=10)
+            log.info(f"Ping OK ({resp.status_code})")
+        except Exception as ex:
+            log.warning(f"Ping failed: {ex}")
+        time.sleep(300)
 
 def setup_webhook():
     url = os.getenv("RAILWAY_STATIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
@@ -820,5 +845,6 @@ def setup_webhook():
 if __name__ == "__main__":
     setup_webhook()
     threading.Thread(target=run_scheduler, daemon=True).start()
+    threading.Thread(target=self_ping,     daemon=True).start()
     log.info(f"Bot starting on port {PORT}")
     app.run(host="0.0.0.0", port=PORT)
