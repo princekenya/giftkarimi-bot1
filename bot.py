@@ -13,6 +13,7 @@ import html
 import schedule
 import time
 import threading
+import concurrent.futures
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -501,17 +502,29 @@ def get_geekwire_events():
     return fetch_rss_events("https://www.geekwire.com/events/feed/", "GeekWire")
 
 def get_all_events():
-    log.info("Deep Discovery: Fetching events from all real sources...")
-    all_events = []
+    log.info("Deep Discovery: Fetching events from all real sources in parallel...")
     
-    # Live sources
-    all_events += get_luma_events()
-    all_events += get_eventbrite_events()
-    all_events += get_meetup_events()
-    all_events += get_devto_events()
-    all_events += get_techcrunch_events()
-    all_events += get_wired_events()
-    all_events += get_geekwire_events()
+    sources = [
+        get_luma_events,
+        get_eventbrite_events,
+        get_meetup_events,
+        get_devto_events,
+        get_techcrunch_events,
+        get_wired_events,
+        get_geekwire_events
+    ]
+    
+    all_events = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_source = {executor.submit(getter): getter.__name__ for getter in sources}
+        for future in concurrent.futures.as_completed(future_to_source):
+            src_name = future_to_source[future]
+            try:
+                res = future.result()
+                all_events.extend(res)
+                log.info(f"   + {len(res)} from {src_name}")
+            except Exception as e:
+                log.error(f"Error polling {src_name}: {e}")
 
     # Deduplicate by URL
     seen_urls, unique = set(), []
