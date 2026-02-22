@@ -9,9 +9,11 @@ import os
 import json
 import logging
 import requests
+import html
 import schedule
 import time
 import threading
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request, render_template_string
@@ -30,9 +32,11 @@ MIN_EVENTS         = int(os.getenv("MIN_EVENTS", "10"))
 MAX_EVENTS         = int(os.getenv("MAX_EVENTS", "15"))
 ADMIN_PASSWORD     = os.getenv("ADMIN_PASSWORD", "gift2024")
 PORT               = int(os.getenv("PORT", "5000"))
+TEST_INTERVAL_MINS = int(os.getenv("TEST_INTERVAL_MINS", "0"))
 
 SUBSCRIBERS_FILE   = "subscribers.json"
 SENT_IDS_FILE      = "sent_ids.json"
+LAST_RUN_FILE      = "last_run.json"
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; TechEventsBot/1.0)"}
@@ -68,10 +72,38 @@ def save_sent_ids(ids):
     with open(SENT_IDS_FILE, "w") as f:
         json.dump(list(ids), f)
 
+def load_last_run():
+    if os.path.exists(LAST_RUN_FILE):
+        try:
+            with open(LAST_RUN_FILE) as f:
+                return json.load(f).get("last_sent_day")
+        except Exception: pass
+    return None
+
+def load_last_run_timestamp():
+    if os.path.exists(LAST_RUN_FILE):
+        try:
+            with open(LAST_RUN_FILE) as f:
+                return json.load(f).get("last_sent_ts") or 0
+        except Exception: pass
+    return 0
+
+def save_last_run(day_str=None, ts=None):
+    data = {}
+    if os.path.exists(LAST_RUN_FILE):
+        try:
+            with open(LAST_RUN_FILE) as f:
+                data = json.load(f)
+        except Exception: pass
+    if day_str: data["last_sent_day"] = day_str
+    if ts: data["last_sent_ts"] = ts
+    with open(LAST_RUN_FILE, "w") as f:
+        json.dump(data, f)
+
 
 # ─── Telegram ────────────────────────────────────────────────────────────────
 
-def send_message(chat_id, text, parse_mode="Markdown", show_button=False):
+def send_message(chat_id, text, parse_mode="HTML", show_button=False):
     try:
         payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
         if show_button:
@@ -433,30 +465,70 @@ def get_curated_events():
 #  AGGREGATOR
 # ══════════════════════════════════════════════════════════════════════════════
 
+def fetch_rss_events(url, source):
+    """Generic RSS event fetcher using standard library xml.etree."""
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        root    = ET.fromstring(resp.content)
+        channel = root.find("channel")
+        results = []
+        for item in channel.findall("item")[:20]:
+            title = (item.findtext("title") or "").strip()
+            link  = (item.findtext("link") or "").strip()
+            if not title or not link: continue
+            if not is_tech(title): continue
+            results.append({
+                "id": f"rss_{hash(link) % 999999}",
+                "title": title,
+                "date": "See link for date",
+                "url": link,
+                "source": source,
+                "rsvp": True
+            })
+        return results
+    except Exception as e:
+        log.error(f"RSS error from {source}: {e}")
+        return []
+
+def get_techcrunch_events():
+    return fetch_rss_events("https://techcrunch.com/category/events/feed/", "TechCrunch")
+
+def get_wired_events():
+    return fetch_rss_events("https://www.wired.com/feed/category/business/latest/rss", "Wired")
+
+def get_geekwire_events():
+    return fetch_rss_events("https://www.geekwire.com/events/feed/", "GeekWire")
+
 def get_all_events():
-    log.info("Fetching events from all real sources...")
+    log.info("Deep Discovery: Fetching events from all real sources...")
     all_events = []
+    
+    # Live sources
     all_events += get_luma_events()
     all_events += get_eventbrite_events()
     all_events += get_meetup_events()
     all_events += get_devto_events()
+    all_events += get_techcrunch_events()
+    all_events += get_wired_events()
+    all_events += get_geekwire_events()
 
-    # Deduplicate by title
-    seen, unique = set(), []
+    # Deduplicate by URL
+    seen_urls, unique = set(), []
     for e in all_events:
-        key = e["title"].lower().strip()[:60]
-        if key not in seen and e["title"]:
-            seen.add(key)
+        if e["url"] not in seen_urls and e["title"]:
+            seen_urls.add(e["url"])
             unique.append(e)
 
     log.info(f"Live events found: {len(unique)}")
 
     # Pad with curated events if not enough
     if len(unique) < MIN_EVENTS:
+        seen_titles = {e["title"].lower().strip()[:60] for e in unique}
         for e in get_curated_events():
             key = e["title"].lower().strip()[:60]
-            if key not in seen:
-                seen.add(key)
+            if key not in seen_titles:
+                seen_titles.add(key)
                 unique.append(e)
         log.info(f"After padding: {len(unique)} events")
 
@@ -467,29 +539,38 @@ def get_all_events():
 
 def build_message(events):
     today = datetime.now().strftime("%A, %d %b %Y")
-    msg   = f"🖥️ *Free Tech Events — RSVP Links*\n📅 {today}\n\n"
+    msg   = f"🖥️ <b>Free Tech Events — RSVP Links</b>\n📅 {today}\n\n"
     for i, e in enumerate(events, 1):
-        msg += f"*{i}. {e['title']}*\n"
+        title  = html.escape(e['title'])
+        source = html.escape(e['source'])
+        msg += f"<b>{i}. {title}</b>\n"
         if e["date"] not in ("See link", "See link for date", "Ongoing"):
             msg += f"   📆 {e['date']}\n"
-        msg += f"   🔗 [Click to RSVP]({e['url']})\n"
-        msg += f"   📌 _{e['source']}_\n\n"
-    msg += "_Tap the button below to refresh anytime! 👇_"
+        msg += f"   🔗 <a href='{e['url']}'>Click Here to RSVP</a>\n"
+        msg += f"   📌 <i>{source}</i>\n\n"
+    msg += "<i>Tap the button below to refresh anytime! 👇</i>"
     return msg
 
 
 # ─── Broadcast ───────────────────────────────────────────────────────────────
 
-def broadcast_events():
-    log.info("─── Broadcasting ───")
+def broadcast_events(force=False):
+    log.info("─── Broadcast process started ───")
     subscribers = load_subscribers()
     if not subscribers:
+        log.info("No subscribers found.")
         return {"sent": 0, "failed": 0, "events": 0}
 
     sent_ids   = load_sent_ids()
     all_events = get_all_events()
-    new_events = [e for e in all_events if e["id"] not in sent_ids]
-    if len(new_events) < MIN_EVENTS:
+    
+    if force:
+        new_events = all_events
+        log.info("Test Mode: Bypassing duplicate filters.")
+    else:
+        new_events = [e for e in all_events if e["id"] not in sent_ids]
+    
+    if len(new_events) < MIN_EVENTS and not force:
         new_events = all_events
 
     to_send = new_events[:MAX_EVENTS]
@@ -502,8 +583,10 @@ def broadcast_events():
         else:
             failed += 1
 
-    sent_ids.update(e["id"] for e in to_send)
-    save_sent_ids(sent_ids)
+    if not force:
+        sent_ids.update(e["id"] for e in to_send)
+        save_sent_ids(sent_ids)
+        
     log.info(f"Broadcast: {sent} sent, {failed} failed, {len(to_send)} events")
     return {"sent": sent, "failed": failed, "events": len(to_send)}
 
@@ -651,17 +734,19 @@ ADMIN_HTML = """
   input { width: 100%; padding: 12px; border: 1px solid #2a2a4a; border-radius: 8px;
           background: #0f0f1a; color: #fff; font-size: 15px; margin-bottom: 12px; }
   .result-box { background: #0f0f1a; border-radius: 8px; padding: 12px;
-                font-size: 13px; color: #7cf8a8; margin-top: 10px; display: none; }
-  #adminPanel { display: none; }
+                font-size: 13px; color: #7cf8a8; margin-top: 10px; display: none; line-height: 1.4; border: 1px solid #2a2a4a; }
+  .tag { padding: 2px 8px; border-radius: 8px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+  .tag-green { background: #7cf8a8; color: #111; }
+  .tag-orange { background: #f8a07c; color: #111; }
 </style>
 </head>
 <body>
 <div class="login-wrap" id="loginWrap">
   <div class="login-card">
-    <h2>🤖 Admin Panel</h2>
-    <p>Giftkarimi Tech Events Bot</p>
-    <input type="password" id="pwInput" placeholder="Enter password" />
-    <button class="btn btn-primary" onclick="login()">Login</button>
+    <h2 style="font-size: 24px; margin-bottom: 10px;">🛡️ Tech Admin</h2>
+    <p style="margin-bottom: 25px;">Secure Access Required</p>
+    <input type="password" id="pwInput" placeholder="Password" style="text-align: center;" />
+    <button class="btn btn-primary" onclick="login()">Enter Dashboard</button>
   </div>
 </div>
 
@@ -675,12 +760,12 @@ ADMIN_HTML = """
       <h2>📊 Stats</h2>
       <div class="stat"><span class="stat-label">Total Subscribers</span>
         <span class="stat-value" id="subCount">—</span></div>
-      <div class="stat"><span class="stat-label">Bot Username</span>
-        <span class="stat-value" style="font-size:13px">@Giftkarimi_bot</span></div>
+      <div class="stat"><span class="stat-label">Scheduler Mode</span>
+        <span class="stat-value" id="schedulerMode">—</span></div>
       <div class="stat"><span class="stat-label">Daily Send Time</span>
-        <span class="stat-value" style="font-size:13px">8:00 AM</span></div>
-      <div class="stat"><span class="stat-label">Min Events</span>
-        <span class="stat-value" style="font-size:13px">10 (with RSVP links)</span></div>
+        <span class="stat-value" id="broadcastTime">8:00 AM EAT</span></div>
+      <div class="stat"><span class="stat-label">Min Events Per Post</span>
+        <span class="stat-value">10</span></div>
     </div>
 
     <div class="card">
@@ -702,6 +787,7 @@ ADMIN_HTML = """
     <div class="card">
       <h2>⚡ Actions</h2>
       <button class="btn btn-success" onclick="broadcast()">📤 Send Events to All Now</button>
+      <button class="btn btn-primary" onclick="testBroadcast()">🧪 Send TEST to Admin Only</button>
       <button class="btn btn-primary" onclick="loadSubscribers()">🔄 Refresh</button>
       <div class="result-box" id="resultBox"></div>
     </div>
@@ -722,14 +808,22 @@ function login() {
     if (r.ok) {
       document.getElementById("loginWrap").style.display = "none";
       document.getElementById("adminPanel").style.display = "block";
+      showToast("🔓 Access Granted");
       loadData();
-    } else { showToast("❌ Wrong password"); }
+    } else { showToast("❌ Incorrect Password"); }
   });
 }
 function loadData() {
   fetch("/admin/stats", { headers: { "X-Admin-Password": password } })
     .then(r => r.json()).then(d => {
       document.getElementById("subCount").textContent = d.subscriber_count;
+      document.getElementById("broadcastTime").textContent = d.send_time + " AM EAT";
+      const modeEl = document.getElementById("schedulerMode");
+      if (d.test_interval > 0) {
+        modeEl.innerHTML = `<span class="tag tag-orange">Interval (${d.test_interval}m)</span>`;
+      } else {
+        modeEl.innerHTML = `<span class="tag tag-green">Daily</span>`;
+      }
     });
   loadSubscribers();
 }
@@ -755,11 +849,21 @@ function loadSubscribers() {
 function broadcast() {
   const box = document.getElementById("resultBox");
   box.style.display = "block";
-  box.textContent = "⏳ Fetching RSVP events and sending...";
+  box.textContent = "⏳ Fetching RSVP events and sending to all...";
   fetch("/admin/broadcast", { method: "POST", headers: { "X-Admin-Password": password } })
     .then(r => r.json()).then(d => {
       box.textContent = `✅ Sent to ${d.sent} subscribers with ${d.events} events!`;
       showToast("✅ Done!");
+    }).catch(() => { box.textContent = "❌ Something went wrong."; });
+}
+function testBroadcast() {
+  const box = document.getElementById("resultBox");
+  box.style.display = "block";
+  box.textContent = "⏳ Sending test broadcast to admin...";
+  fetch("/admin/test-broadcast", { method: "POST", headers: { "X-Admin-Password": password } })
+    .then(r => r.json()).then(d => {
+      box.textContent = d.success ? "✅ Test message sent to admin!" : "❌ " + d.error;
+      showToast(d.success ? "✅ Done!" : "❌ Error");
     }).catch(() => { box.textContent = "❌ Something went wrong."; });
 }
 function showToast(msg) {
@@ -783,7 +887,12 @@ def index():
 @app.route("/admin/stats")
 def admin_stats():
     if not check_admin(request): return jsonify({"error": "Unauthorized"}), 401
-    return jsonify({"subscriber_count": len(load_subscribers()), "send_time": SEND_TIME})
+    return jsonify({
+        "subscriber_count": len(load_subscribers()),
+        "send_time": SEND_TIME,
+        "test_interval": TEST_INTERVAL_MINS,
+        "nairobi_time": datetime.now(ZoneInfo("Africa/Nairobi")).strftime("%I:%M %p EAT")
+    })
 
 @app.route("/admin/subscribers")
 def admin_subscribers():
@@ -799,6 +908,22 @@ def admin_broadcast():
     if not check_admin(request): return jsonify({"error": "Unauthorized"}), 401
     return jsonify(broadcast_events())
 
+@app.route("/admin/test-broadcast", methods=["POST"])
+def admin_test_broadcast():
+    if not check_admin(request): return jsonify({"error": "Unauthorized"}), 401
+    test_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not test_id:
+        subs = load_subscribers()
+        if subs: test_id = list(subs.keys())[0]
+    
+    if not test_id:
+        return jsonify({"success": False, "error": "No subscriber found for testing"})
+    
+    all_events = get_all_events()
+    message = build_message(all_events[:MAX_EVENTS])
+    success = send_message(test_id, "🧪 <b>TEST BROADCAST</b>\n\n" + message)
+    return jsonify({"success": success, "error": None if success else "Telegram failed"})
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "version": "rsvp-edition"})
@@ -808,28 +933,58 @@ def health():
 
 def run_scheduler():
     """
-    TEST MODE: sends every 1 minute regardless of time.
-    Switch back to daily after testing.
+    Bulletproof scheduler using Kenyan time.
+    Supports either Daily Mode or Interval Mode (for testing).
     """
-    log.info("TEST MODE: Broadcasting every 1 minute")
     EAT = ZoneInfo("Africa/Nairobi")
+    if TEST_INTERVAL_MINS > 0:
+        log.info(f"Scheduler started — INTERVAL MODE: sending every {TEST_INTERVAL_MINS} minute(s)")
+    else:
+        log.info(f"Scheduler started — DAILY MODE: sending at {SEND_TIME} EAT (Nairobi)")
+    
+    send_hour, send_min = map(int, SEND_TIME.split(":"))
 
     while True:
         try:
             now = datetime.now(EAT)
-            log.info(f"TEST: Sending now — Nairobi: {now.strftime('%H:%M:%S EAT')}")
-            broadcast_events()
+            
+            if TEST_INTERVAL_MINS > 0:
+                # ─── Interval Mode ───
+                last_ts  = load_last_run_timestamp()
+                now_ts   = int(now.timestamp())
+                wait_sec = (last_ts + TEST_INTERVAL_MINS * 60) - now_ts
+                
+                if wait_sec <= 0:
+                    log.info(f"Interval trigger — sending broadcast ({TEST_INTERVAL_MINS} min interval)")
+                    broadcast_events(force=True)
+                    save_last_run(ts=now_ts)
+                else:
+                    if now_ts % 60 == 0:
+                        log.info(f"Interval Mode: Next trigger in {wait_sec}s")
+            else:
+                # ─── Daily Mode ───
+                today_str     = now.strftime("%Y-%m-%d")
+                last_sent_day = load_last_run()
+                now_total     = now.hour * 60 + now.minute
+                snd_total     = send_hour * 60 + send_min
+
+                if now_total >= snd_total and last_sent_day != today_str:
+                    log.info(f"Daily trigger — sending broadcast (Nairobi: {now.strftime('%H:%M EAT')})")
+                    broadcast_events()
+                    save_last_run(day_str=today_str)
+                    
         except Exception as ex:
             log.error(f"Scheduler error: {ex}")
-        time.sleep(60)  # every 1 minute
+        time.sleep(20)
 
 def self_ping():
     """Pings /health every 5 minutes to prevent Railway free tier from sleeping."""
-    app_url = os.getenv("RAILWAY_STATIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
+    app_url = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RAILWAY_STATIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
     if not app_url:
         log.warning("No app URL for self-ping — bot may sleep and miss send time.")
         return
-    ping_url = f"https://{app_url}/health"
+    prefix = "" if app_url.startswith("http") else "https://"
+    ping_url = f"{prefix}{app_url}/health"
     log.info(f"Self-ping active → {ping_url} every 5 min")
     while True:
         try:
@@ -840,9 +995,10 @@ def self_ping():
         time.sleep(300)
 
 def setup_webhook():
-    url = os.getenv("RAILWAY_STATIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
-    if url:
-        set_webhook(f"https://{url}/webhook/{TELEGRAM_BOT_TOKEN}")
+    app_url = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RAILWAY_STATIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
+    if app_url:
+        prefix = "" if app_url.startswith("http") else "https://"
+        set_webhook(f"{prefix}{app_url}/webhook/{TELEGRAM_BOT_TOKEN}")
 
 # Start background threads at module level so gunicorn picks them up
 setup_webhook()
