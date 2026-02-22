@@ -808,31 +808,20 @@ def health():
 
 def run_scheduler():
     """
-    Bulletproof scheduler using Kenyan time.
-    Checks every 20 seconds. If it's past send time and not yet sent today, sends immediately.
-    This means even if the bot restarts mid-day, it will still send.
+    TEST MODE: sends every 1 minute regardless of time.
+    Switch back to daily after testing.
     """
-    log.info(f"Scheduler started — daily broadcast at {SEND_TIME} EAT (Nairobi)")
-    EAT           = ZoneInfo("Africa/Nairobi")
-    last_sent_day = None
-
-    send_hour, send_min = map(int, SEND_TIME.split(":"))
+    log.info("TEST MODE: Broadcasting every 1 minute")
+    EAT = ZoneInfo("Africa/Nairobi")
 
     while True:
         try:
-            now       = datetime.now(EAT)
-            today_str = now.strftime("%Y-%m-%d")
-            now_total = now.hour * 60 + now.minute
-            snd_total = send_hour * 60 + send_min
-
-            # Send if: past send time today AND not yet sent today
-            if now_total >= snd_total and last_sent_day != today_str:
-                log.info(f"Sending daily broadcast — Nairobi time: {now.strftime('%H:%M EAT')}")
-                broadcast_events()
-                last_sent_day = today_str
+            now = datetime.now(EAT)
+            log.info(f"TEST: Sending now — Nairobi: {now.strftime('%H:%M:%S EAT')}")
+            broadcast_events()
         except Exception as ex:
             log.error(f"Scheduler error: {ex}")
-        time.sleep(20)
+        time.sleep(60)  # every 1 minute
 
 def self_ping():
     """Pings /health every 5 minutes to prevent Railway free tier from sleeping."""
