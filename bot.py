@@ -844,9 +844,12 @@ def setup_webhook():
     if url:
         set_webhook(f"https://{url}/webhook/{TELEGRAM_BOT_TOKEN}")
 
+# Start background threads at module level so gunicorn picks them up
+setup_webhook()
+threading.Thread(target=run_scheduler, daemon=True).start()
+threading.Thread(target=self_ping,     daemon=True).start()
+log.info(f"Bot started — scheduler and self-ping running")
+
 if __name__ == "__main__":
-    setup_webhook()
-    threading.Thread(target=run_scheduler, daemon=True).start()
-    threading.Thread(target=self_ping,     daemon=True).start()
-    log.info(f"Bot starting on port {PORT}")
+    log.info(f"Running directly on port {PORT}")
     app.run(host="0.0.0.0", port=PORT)
