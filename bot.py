@@ -50,6 +50,11 @@ GET_EVENTS_BUTTON = {
 
 app = Flask(__name__)
 
+# ─── Cache ───────────────────────────────────────────────────────────────────
+GLOBAL_CACHE      = []
+LAST_FETCH_TIME   = None
+CACHE_EXPIRY_MINS = 15
+
 
 # ─── Storage ─────────────────────────────────────────────────────────────────
 
@@ -109,7 +114,7 @@ def send_message(chat_id, text, parse_mode="HTML", show_button=False):
         payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
         if show_button:
             payload["reply_markup"] = GET_EVENTS_BUTTON
-        resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=15)
+        resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=8)
         return resp.ok
     except Exception as ex:
         log.error(f"Telegram error to {chat_id}: {ex}")
@@ -156,7 +161,7 @@ def get_luma_events():
                 resp = requests.get(
                     "https://api.lu.ma/public/v1/event/search",
                     params={"query": q, "event_type": "online", "pagination_limit": 10},
-                    headers=HEADERS, timeout=15
+                    headers=HEADERS, timeout=8
                 )
                 if not resp.ok:
                     continue
@@ -219,7 +224,7 @@ def get_eventbrite_events():
         }
         resp = requests.get(url, params=params,
                             headers={"Authorization": f"Bearer {EVENTBRITE_TOKEN}"},
-                            timeout=15)
+                            timeout=8)
         resp.raise_for_status()
         results = []
         for e in resp.json().get("events", []):
@@ -278,7 +283,7 @@ def get_meetup_events():
                 resp = requests.post(
                     "https://api.meetup.com/gql",
                     json={"query": query, "variables": variables},
-                    headers=HEADERS, timeout=15
+                    headers=HEADERS, timeout=8
                 )
                 if not resp.ok:
                     continue
@@ -323,7 +328,7 @@ def get_devto_events():
         resp = requests.get(
             "https://dev.to/api/listings",
             params={"category": "events", "per_page": 30},
-            headers=HEADERS, timeout=15
+            headers=HEADERS, timeout=8
         )
         resp.raise_for_status()
         results = []
@@ -469,7 +474,7 @@ def get_curated_events():
 def fetch_rss_events(url, source):
     """Generic RSS event fetcher using standard library xml.etree."""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = requests.get(url, headers=HEADERS, timeout=8)
         resp.raise_for_status()
         root    = ET.fromstring(resp.content)
         channel = root.find("channel")
@@ -501,16 +506,22 @@ def get_wired_events():
 def get_geekwire_events():
     return fetch_rss_events("https://www.geekwire.com/events/feed/", "GeekWire")
 
-def get_all_events():
+def get_all_events(use_cache=True):
+    global GLOBAL_CACHE, LAST_FETCH_TIME
+    
+    # Check cache if allowed
+    now = datetime.now()
+    if use_cache and LAST_FETCH_TIME:
+        diff = (now - LAST_FETCH_TIME).total_seconds() / 60
+        if diff < CACHE_EXPIRY_MINS and GLOBAL_CACHE:
+            log.info(f"Using cache ({int(diff)} min old, {len(GLOBAL_CACHE)} items)")
+            return GLOBAL_CACHE
+
     log.info("Deep Discovery: Fetching events from all real sources in parallel...")
     
     sources = [
-        get_luma_events,
-        get_eventbrite_events,
-        get_meetup_events,
-        get_devto_events,
-        get_techcrunch_events,
-        get_wired_events,
+        get_luma_events, get_eventbrite_events, get_meetup_events,
+        get_devto_events, get_techcrunch_events, get_wired_events,
         get_geekwire_events
     ]
     
@@ -533,8 +544,6 @@ def get_all_events():
             seen_urls.add(e["url"])
             unique.append(e)
 
-    log.info(f"Live events found: {len(unique)}")
-
     # Pad with curated events if not enough
     if len(unique) < MIN_EVENTS:
         seen_titles = {e["title"].lower().strip()[:60] for e in unique}
@@ -543,7 +552,11 @@ def get_all_events():
             if key not in seen_titles:
                 seen_titles.add(key)
                 unique.append(e)
-        log.info(f"After padding: {len(unique)} events")
+    
+    # Update cache
+    GLOBAL_CACHE = unique
+    LAST_FETCH_TIME = now
+    log.info(f"Cache updated: {len(GLOBAL_CACHE)} events")
 
     return unique
 
